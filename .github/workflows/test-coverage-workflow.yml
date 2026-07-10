@@ -1,0 +1,171 @@
+name: Test ELD code coverage (fork)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}
+      cancel-in-progress: true
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout llvm-project
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: llvm/llvm-project
+          path: llvm-project
+
+      - name: Checkout eld
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.ref_name }}
+          path: llvm-project/llvm/tools/eld
+
+      - name: Set up Clang 22
+        uses: egor-tensin/setup-clang@23bc15cd4207e45f1566447deb48f4ff3ef932cb #v2.3
+        with:
+          version: "22"
+          platform: x64
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lld-22 llvm-22 llvm-22-dev libc++-22-dev libc++abi-22-dev ninja-build
+          echo "PATH=/usr/lib/llvm-22/bin:$PATH" >> $GITHUB_ENV
+
+      - name: Run CMake
+        run: |
+          rm -rf obj
+          mkdir -p obj
+          cd obj
+          cmake -G Ninja \
+            ../llvm-project/llvm/tools/eld \
+            -DELD_USE_EXTERNAL_LLVM=ON \
+            -DLLVM_DIR=/usr/lib/llvm-22/lib/cmake/llvm \
+            -DLLVM_TABLEGEN_EXE=/usr/lib/llvm-22/bin/llvm-tblgen \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON \
+            -DLLVM_ENABLE_ASSERTIONS:BOOL=ON \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
+            -DELD_TARGETS_TO_BUILD="X86" \
+            -DELD_ENABLE_SYMBOL_VERSIONING=ON \
+            -DELD_ENABLE_RUN_TESTS:BOOL=ON \
+            -DELD_COVERAGE=ON
+
+      - name: Build
+        working-directory: obj
+        run: ninja
+
+      - name: Run tests with coverage profiling
+        working-directory: obj
+        run: LLVM_PROFILE_FILE="$PWD/eld-%p.profraw" ninja check-eld
+
+      - name: Summarize test results
+        working-directory: obj
+        run: ninja check-eld-summary
+
+      - name: Merge profile data
+        working-directory: obj
+        run: llvm-profdata merge -sparse eld-*.profraw -o eld.profdata
+
+      - name: Generate HTML coverage report
+        working-directory: obj
+        run: |
+          llvm-cov show \
+            --format=html \
+            --instr-profile=eld.profdata \
+            --object lib/libLW.so \
+            --show-branches=count \
+            --show-expansions \
+            --show-instantiations \
+            --include-filename-regex='/eld/' \
+            -o coverage-report
+
+      - name: Extract coverage and check for regression
+        working-directory: obj
+        run: |
+          COV_SUMMARY=$(llvm-cov report \
+            --instr-profile=eld.profdata \
+            --object lib/libLW.so \
+            --include-filename-regex='/eld/')
+
+          TOTAL_LINE=$(echo "$COV_SUMMARY" | grep '^TOTAL')
+
+          REGION_COV=$(echo "$TOTAL_LINE" | awk '{print $4}')
+          FUNC_COV=$(echo   "$TOTAL_LINE" | awk '{print $7}')
+          LINE_COV=$(echo   "$TOTAL_LINE" | awk '{print $10}')
+          BRANCH_COV=$(echo "$TOTAL_LINE" | awk '{print $13}')
+
+          # Export for the deploy step
+          echo "LINE_COV=$LINE_COV"       >> "$GITHUB_ENV"
+          echo "FUNC_COV=$FUNC_COV"       >> "$GITHUB_ENV"
+          echo "REGION_COV=$REGION_COV"   >> "$GITHUB_ENV"
+          echo "BRANCH_COV=$BRANCH_COV"   >> "$GITHUB_ENV"
+
+          # Fetch baseline from the code-coverage-reports branch (if it exists)
+          BASELINE=$(git -C "${{ github.workspace }}/llvm-project/llvm/tools/eld" \
+            show origin/code-coverage-reports:coverage-baseline.txt 2>/dev/null || true)
+
+          if [ -z "$BASELINE" ]; then
+            echo "No baseline found — first run, will record baseline."
+            exit 0
+          fi
+
+          echo "Baseline:"
+          echo "$BASELINE"
+
+          PREV_LINE=$(echo     "$BASELINE" | grep '^LINE='     | cut -d= -f2)
+          PREV_FUNC=$(echo     "$BASELINE" | grep '^FUNCTION=' | cut -d= -f2)
+          PREV_REGION=$(echo   "$BASELINE" | grep '^REGION='   | cut -d= -f2)
+          PREV_BRANCH=$(echo   "$BASELINE" | grep '^BRANCH='   | cut -d= -f2)
+
+          # awk_lt a b — exits 0 (true) when a < b (strips trailing %)
+          awk_lt() {
+            awk -v a="${1%%%}" -v b="${2%%%}" 'BEGIN { exit !(a+0 < b+0) }'
+          }
+
+          REGRESSIONS=""
+          awk_lt "$LINE_COV"   "$PREV_LINE"   && REGRESSIONS="${REGRESSIONS}  LINE:     $LINE_COV < $PREV_LINE (baseline)\n"
+          awk_lt "$FUNC_COV"   "$PREV_FUNC"   && REGRESSIONS="${REGRESSIONS}  FUNCTION: $FUNC_COV < $PREV_FUNC (baseline)\n"
+          awk_lt "$REGION_COV" "$PREV_REGION" && REGRESSIONS="${REGRESSIONS}  REGION:   $REGION_COV < $PREV_REGION (baseline)\n"
+          awk_lt "$BRANCH_COV" "$PREV_BRANCH" && REGRESSIONS="${REGRESSIONS}  BRANCH:   $BRANCH_COV < $PREV_BRANCH (baseline)\n"
+
+          if [ -n "$REGRESSIONS" ]; then
+            echo "Coverage regression detected:"
+            printf "%b" "$REGRESSIONS"
+            exit 1
+          fi
+
+          echo "No regression detected."
+
+      - name: Deploy coverage report to code-coverage-reports branch
+        run: |
+          REPORT_SRC="${{ github.workspace }}/obj/coverage-report"
+
+          cd llvm-project/llvm/tools/eld
+          git config user.name  'github-actions'
+          git config user.email 'github-actions@github.com'
+
+          git checkout --orphan code-coverage-reports
+          git rm -rf .
+
+          cp -r "${REPORT_SRC}/." .
+
+          printf 'LINE=%s\nFUNCTION=%s\nREGION=%s\nBRANCH=%s\n' \
+            "${LINE_COV}" "${FUNC_COV}" "${REGION_COV}" "${BRANCH_COV}" \
+            > coverage-baseline.txt
+
+          touch .nojekyll
+          git add .
+          git commit -m "Update ELD coverage report ($(date -u '+%Y-%m-%d'))"
+          git push -f origin HEAD:refs/heads/code-coverage-reports
