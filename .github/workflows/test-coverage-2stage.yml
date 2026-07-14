@@ -1,0 +1,158 @@
+name: Test ELD code coverage 2-stage (fork, include-flag)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  coverage-2stage:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}
+      cancel-in-progress: true
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout llvm-project
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: llvm/llvm-project
+          path: llvm-project
+
+      - name: Checkout eld
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.ref_name }}
+          path: llvm-project/llvm/tools/eld
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be #v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: true
+
+      - name: Set up Clang 22
+        uses: egor-tensin/setup-clang@23bc15cd4207e45f1566447deb48f4ff3ef932cb #v2.3
+        with:
+          version: "22"
+          platform: x64
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lld-22 libc++-22-dev libc++abi-22-dev ninja-build \
+            gcc-arm-linux-gnueabi gcc-aarch64-linux-gnu \
+            gcc-riscv64-linux-gnu qemu-user
+          echo "PATH=/usr/lib/llvm-22/bin:$PATH" >> $GITHUB_ENV
+
+      # ── Stage 1: build a from-source clang (v11 profraw) + compiler-rt ──────
+      - name: Stage 1 - CMake (bootstrap clang)
+        run: |
+          sudo mkdir -p /mnt/stage1
+          sudo chown "$USER" /mnt/stage1
+          ln -s /mnt/stage1 stage1
+          cd stage1
+          cmake -G Ninja \
+            ../llvm-project/llvm \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON \
+            -DLLVM_ENABLE_PROJECTS="clang" \
+            -DLLVM_ENABLE_RUNTIMES="compiler-rt" \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
+            -DLLVM_TARGETS_TO_BUILD="X86"
+
+      - name: Stage 1 - Build clang
+        working-directory: stage1
+        run: ninja clang
+
+      # ── Stage 2: build LLVM+ELD with the stage-1 clang (v11 profraw) ────────
+      - name: Stage 2 - CMake (ELD with coverage, built by stage-1 clang)
+        run: |
+          sudo mkdir -p /mnt/obj
+          sudo chown "$USER" /mnt/obj
+          ln -s /mnt/obj obj
+          cd obj
+          cmake -G Ninja \
+            ../llvm-project/llvm \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON \
+            -DLLVM_ENABLE_PROJECTS="llvm;clang" \
+            -DLLVM_ENABLE_ASSERTIONS:BOOL=ON \
+            -DCMAKE_C_COMPILER="$GITHUB_WORKSPACE/stage1/bin/clang" \
+            -DCMAKE_CXX_COMPILER="$GITHUB_WORKSPACE/stage1/bin/clang++" \
+            -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
+            -DLLVM_TARGETS_TO_BUILD="ARM;AArch64;RISCV;X86" \
+            -DLLVM_EXTERNAL_PROJECTS=eld \
+            -DLLVM_EXTERNAL_ELD_SOURCE_DIR=../llvm-project/llvm/tools/eld \
+            -DELD_TARGETS_TO_BUILD="ARM;AArch64;RISCV;X86" \
+            -DELD_ENABLE_SYMBOL_VERSIONING=ON \
+            -DELD_ENABLE_RUN_TESTS:BOOL=ON \
+            -DELD_COVERAGE=ON
+
+      - name: Stage 2 - Build
+        working-directory: obj
+        run: ninja
+
+      - name: Run tests with coverage profiling
+        working-directory: obj
+        run: |
+          export ELD_ARM_C_COMPILER=arm-linux-gnueabi-gcc
+          export ELD_ARM_CXX_COMPILER=arm-linux-gnueabi-g++
+          export ELD_AARCH64_C_COMPILER=aarch64-linux-gnu-gcc
+          export ELD_AARCH64_CXX_COMPILER=aarch64-linux-gnu-g++
+          export ELD_RISCV64_C_COMPILER=riscv64-linux-gnu-gcc
+          export ELD_RISCV64_CXX_COMPILER=riscv64-linux-gnu-g++
+          LLVM_PROFILE_FILE="$PWD/eld-%p.profraw" ninja check-eld
+
+      - name: Summarize test results
+        working-directory: obj
+        run: ninja check-eld-summary
+
+      - name: Merge profile data
+        working-directory: obj
+        run: ./bin/llvm-profdata merge -sparse eld-*.profraw -o eld.profdata
+
+      - name: Generate HTML coverage report
+        working-directory: obj
+        run: |
+          ./bin/llvm-cov show \
+            --format=html \
+            --instr-profile=eld.profdata \
+            --object lib/libLW.so \
+            --show-branches=count \
+            --show-expansions \
+            --show-instantiations \
+            --include-filename-regex='/eld/' \
+            -o coverage-report
+
+      - name: Extract coverage and check for regression
+        working-directory: obj
+        run: |
+          COV_SUMMARY=$(./bin/llvm-cov report \
+            --instr-profile=eld.profdata \
+            --object lib/libLW.so \
+            --include-filename-regex='/eld/')
+
+          TOTAL_LINE=$(echo "$COV_SUMMARY" | grep '^TOTAL')
+
+          REGION_COV=$(echo "$TOTAL_LINE" | awk '{print $4}')
+          FUNC_COV=$(echo   "$TOTAL_LINE" | awk '{print $7}')
+          LINE_COV=$(echo   "$TOTAL_LINE" | awk '{print $10}')
+          BRANCH_COV=$(echo "$TOTAL_LINE" | awk '{print $13}')
+
+          echo "LINE_COV=$LINE_COV"       >> "$GITHUB_ENV"
+          echo "FUNC_COV=$FUNC_COV"       >> "$GITHUB_ENV"
+          echo "REGION_COV=$REGION_COV"   >> "$GITHUB_ENV"
+          echo "BRANCH_COV=$BRANCH_COV"   >> "$GITHUB_ENV"
+
+          echo "Coverage: LINE=$LINE_COV FUNCTION=$FUNC_COV REGION=$REGION_COV BRANCH=$BRANCH_COV"
