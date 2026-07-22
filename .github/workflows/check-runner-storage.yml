@@ -1,0 +1,37 @@
+name: Check runner storage
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  check-storage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify storage and writable capacity
+        run: |
+          set +e
+
+          echo "HOME=$HOME"
+          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+
+          echo "=== Disk usage (blocks) ==="
+          df -h
+
+          echo "=== Disk usage (inodes) ==="
+          df -i
+
+          echo "=== Before 10GB write test ==="
+          df -h /
+
+          dd if=/dev/zero of="$GITHUB_WORKSPACE/testfile" bs=1G count=10 status=progress
+          echo "dd exit code: $?"
+
+          echo "=== After 10GB write test ==="
+          df -h /
+
+          ls -lh "$GITHUB_WORKSPACE/testfile"
+          rm -f "$GITHUB_WORKSPACE/testfile"
+
+          echo "=== CPU and memory ==="
+          nproc --all
+          free -h
